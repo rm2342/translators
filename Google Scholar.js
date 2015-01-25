@@ -9,7 +9,7 @@
 	"inRepository": true,
 	"translatorType": 4,
 	"browserSupport": "gcsibv",
-	"lastUpdated": "2014-07-25 21:01:15"
+	"lastUpdated": "2015-01-06 12:25:05"
 }
 
 /*
@@ -378,7 +378,7 @@ function scrapeCaseResults(doc, cases) {
 		}
 	
 		// Instantiate item factory with available data
-		var factory = new ItemFactory(citeletString, attachmentLinks,
+		var factory = new ItemFactory(doc, citeletString, attachmentLinks,
 										titleString, cases[i].bibtexUrl);
 	
 		if (!factory.hasUsefulData()) {
@@ -685,7 +685,14 @@ var scrapeCase = function (doc, url) {
 		// citelet looks kind of like this
 		// Powell v. McCormack, 395 US 486 - Supreme Court 1969
 		var item = new Zotero.Item("case");
-		var factory = new ItemFactory(refFrag.textContent, [url]);
+		var attachmentPointer = url;
+		if (Zotero.isMLZ) {
+			var block = doc.getElementById("gs_opinion_wrapper");
+			if (block) {
+				attachmentPointer = block;
+			}
+		}
+		var factory = new ItemFactory(doc, refFrag.textContent, [attachmentPointer]);
 		factory.repairCitelet();
 		factory.getDate();
 		factory.getCourt();
@@ -706,7 +713,7 @@ var scrapeCase = function (doc, url) {
  * ####################
  */
 
-var ItemFactory = function (citeletString, attachmentLinks, titleString, bibtexLink) {
+var ItemFactory = function (doc, citeletString, attachmentLinks, titleString, bibtexLink) {
 	// var strings
 	this.v = {};
 	this.v.title = titleString;
@@ -720,6 +727,7 @@ var ItemFactory = function (citeletString, attachmentLinks, titleString, bibtexL
 	this.vv.volRepPag = [];
 	// portable array
 	this.attachmentLinks = attachmentLinks;
+	this.doc = doc;
 	// working strings
 	this.citelet = citeletString;
 	this.bibtexLink = bibtexLink;
@@ -741,8 +749,8 @@ ItemFactory.prototype.repairCitelet = function () {
 ItemFactory.prototype.repairTitle = function () {
 	// All-caps words of four or more characters probably need fixing.
 	if (this.v.title.match(/(?:[^a-z]|^)[A-Z]{4,}(?:[^a-z]|$)/)) {
-		this.v.title = ZU.capitalizeTitle(this.v.title.toLowerCase())
-						.replace(/([^0-9a-z])V([^0-9a-z])/, "$1v$2");
+		this.v.title = ZU.capitalizeTitle(this.v.title.toLowerCase(), true)
+								.replace(/([^0-9a-z])V([^0-9a-z])/, "$1v$2");	
 	}
 };
 
@@ -778,7 +786,16 @@ ItemFactory.prototype.getDate = function () {
 	var i, m;
 	// Citelet parsing, step (1)
 	if (!this.hyphenSplit) {
-		this.hyphenSplit = this.citelet.split(/\s+-\s+/);
+		if (this.citelet.match(/\s+-\s+/)) {
+			this.hyphenSplit = this.citelet.split(/\s+-\s+/);
+		} else {
+			m = this.citelet.match(/^(.*),\s+([^,]+Court,\s+[^,]+)$/);
+			if (m) {
+				this.hyphenSplit = [m[1], m[2]];
+			} else {
+				this.hyphenSplit = [this.citelet];
+			}
+		}
 		this.trailingInfo = this.hyphenSplit.slice(-1);
 	}
 	if (!this.v.date && this.v.date !== false) {
@@ -797,6 +814,24 @@ ItemFactory.prototype.getDate = function () {
 			}
 		}
 	}
+	// If we can find a more specific date in the case's centered text then use it
+	var nodesSnapshot = this.doc.evaluate('//div[@id="gs_opinion"]/center', this.doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null );
+	for( var iNode = 0; iNode < nodesSnapshot.snapshotLength; iNode++ ) {
+		var specificDate = nodesSnapshot.snapshotItem(iNode).textContent.trim();
+		// Remove the first word through the first space 
+		//  if it starts with "Deci" or it doesn't start with the first three letters of a month
+		//  and if it doesn't start with Submitted or Argued
+		// (So, words like "Decided", "Dated", and "Released" will be removed)
+		specificDate = specificDate.replace(/^(?:Deci|(?!Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Submitted|Argued))[a-z]+[.:]?\s*/i,"")
+		// Remove the trailing period, if it is there
+			.replace(/\.$/,"");
+		// If the remaining text is a valid date...
+		if (!isNaN(Date.parse(specificDate))) {
+			// ...then use it
+			this.v.date = specificDate;
+			break;
+		}
+	}
 	return this.v.date;
 };
 
@@ -805,14 +840,26 @@ ItemFactory.prototype.getCourt = function () {
 	var s, m;
 	// Citelet parsing, step (2)
 	s = this.hyphenSplit.pop().replace(/,\s*$/, "").replace(/\u2026\s*$/, "Court");
-	m = s.match(/(?:([a-zA-Z]+):\s*)*(.*)/);
+	var court = null;
+	var jurisdiction = null;
+	m = s.match(/(.* Court),\s+(.*)/);
 	if (m) {
-		this.v.court = m[2].replace(/_/g, " ");
-		if (m[1]) {
-			this.v.extra = "{:jurisdiction: " + m[1] + "}";
+		court = m[1];
+		jurisdiction = m[2];
+	}
+	if (!court) {
+		m = s.match(/(?:([a-zA-Z]+):\s*)*(.*)/);
+		if (m) {
+			court = m[2].replace(/_/g, " ");
+			jurisdiction = m[1];
 		}
 	}
-	return this.v.court;
+	if (court) {
+		this.v.court = court;
+	}
+	if (jurisdiction) {
+		this.v.extra = "{:jurisdiction: " + jurisdiction + "}";
+	}
 };
 
 
@@ -865,10 +912,40 @@ ItemFactory.prototype.getDocketNumber = function (doc) {
 
 ItemFactory.prototype.getAttachments = function (doctype) {
 	var i, ilen, attachments;
+	var attachmentTitle = "Google Scholar " + doctype;
 	attachments = [];
 	for (i = 0, ilen = this.attachmentLinks.length; i < ilen; i += 1) {
-		attachments.push({title:"Google Scholar Linked " + doctype, type:"text/html",
-							  url:this.attachmentLinks[i]});
+		if (!this.attachmentLinks[i]) continue;
+		if ("string" === typeof this.attachmentLinks[i]) {
+			attachments.push({
+				title: attachmentTitle,
+				url:this.attachmentLinks[i],
+				type:"text/html"
+			});
+		} else {
+			// DOM fragment and parent doc
+			var block = this.attachmentLinks[i];
+			var doc = block.ownerDocument;
+
+			// String content (title, url, css)
+			var title = doc.getElementsByTagName("title")[0].textContent;
+			var url = doc.documentURI;
+			var css = "*{margin:0;padding:0;}div.mlz-outer{width: 60em;margin:0 auto;text-align:left;}body{text-align:center;}p{margin-top:0.75em;margin-bottom:0.75em;}div.mlz-link-button a{text-decoration:none;background:#cccccc;color:white;border-radius:1em;font-family:sans;padding:0.2em 0.8em 0.2em 0.8em;}div.mlz-link-button a:hover{background:#bbbbbb;}div.mlz-link-button{margin: 0.7em 0 0.8em 0;}";
+
+			// head element
+			var head = doc.createElement("head");
+			head.innerHTML = '<title>' + title + '</title>';
+			head.innerHTML += '<style type="text/css">' + css + '</style>'; 
+
+			var attachmentdoc = Zotero.Utilities.composeDoc(doc, head, block);
+			attachments.push({
+				title: attachmentTitle,
+				document:attachmentdoc
+			});
+
+			// URL for this item
+			this.item.url = url;
+		}
 	}
 	return attachments;
 };
@@ -918,6 +995,9 @@ ItemFactory.prototype.saveItem = function () {
 				bogusItemID += 1;
 				completed_items.push(this.item);
 			}
+			if (completed_items.length === 0) {
+				throw new Error("Failed to parse \"" + this.citelet + "\"");
+			}
 			for (i = 0, ilen = completed_items.length; i < ilen; i += 1) {
 				for (j = 0, jlen = completed_items.length; j < jlen; j += 1) {
 					if (i === j) {
@@ -933,6 +1013,8 @@ ItemFactory.prototype.saveItem = function () {
 			this.pushAttachments("Judgement");
 			this.item.complete();
 		}
+	} else {
+		throw new Error("Failed to find title in \"" + this.citelet + "\"");
 	}
 };
 
@@ -945,6 +1027,47 @@ ItemFactory.prototype.saveItemCommonVars = function () {
 	}
 };
 
+/*
+  Test Case Descriptions:  (these have not been included in the test case JSON below as per 
+                            aurimasv's comment on https://github.com/zotero/translators/pull/833)
+
+		"description": "Legacy test case",
+    "url": "http://scholar.google.com/scholar?q=marbury&hl=en&btnG=Search&as_sdt=1%2C22&as_sdtp=on",
+    
+		"description": "Legacy test case",
+		"url": "http://scholar.google.com/scholar?hl=en&q=kelo&btnG=Search&as_sdt=0%2C22&as_ylo=&as_vis=0",
+    
+		"description": "Legacy test case",
+		"url": "http://scholar.google.com/scholar?hl=en&q=smith&btnG=Search&as_sdt=0%2C22&as_ylo=&as_vis=0",
+    
+		"description": "Legacy test case",
+		"url": "http://scholar.google.com/scholar?hl=en&q=view+of+the+cathedral&btnG=Search&as_sdt=0%2C22&as_ylo=&as_vis=0",
+
+		"description": "Legacy test case",
+		"url": "http://scholar.google.com/scholar?hl=en&q=clifford&btnG=Search&as_sdt=0%2C22&as_ylo=&as_vis=0",
+
+		"description": "Legacy test case",
+		"url": "http://scholar.google.com/scholar_case?case=9834052745083343188&q=marbury+v+madison&hl=en&as_sdt=2,5",
+
+		"description": "Decided date not preceded by any word or any other date line",
+		"url": "http://scholar.google.com/scholar_case?case=11350538941232186766",
+
+		"description": "Decided date preceded by 'Dated'",
+		"url": "http://scholar.google.com/scholar_case?case=4250138655935640563",
+
+		"description": "Decided date preceded by 'Released'",
+		"url": "http://scholar.google.com/scholar_case?case=8121501341214166807",
+
+		"description": "Decided date preceded by 'Decided' and also by a 'Submitted' date line",
+		"url": "http://scholar.google.com/scholar_case?case=834584264358299037",
+
+		"description": "Decided date preceded by 'Decided' and also by an 'Argued' date line",
+		"url": "http://scholar.google.com/scholar_case?case=15235797139493194004",
+
+		"description": "Decided date preceded by 'Decided' and also by an 'Argued' date line and followed by an 'As Modified' line; most citers of this case appear to use the Decided date, not the As Modified date",
+		"url": "http://scholar.google.com/scholar_case?case=163483131267446711",
+    
+*/
 
 /** BEGIN TEST CASES **/
 var testCases = [
@@ -979,25 +1102,206 @@ var testCases = [
 		"items": [
 			{
 				"itemType": "case",
+				"caseName": "Marbury v. Madison",
 				"creators": [],
-				"notes": [],
-				"tags": [],
-				"seeAlso": [],
+				"dateDecided": "1803",
+				"court": "Supreme Court",
+				"firstPage": "137",
+				"itemID": "1",
+				"reporter": "US",
+				"reporterVolume": "5",
 				"attachments": [
 					{
-						"title": "Google Scholar Linked Judgement",
-						"type": "text/html",
-						"url": false
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
 					}
 				],
-				"volume": "5",
-				"reporter": "US",
-				"pages": "137",
-				"title": "Marbury v. Madison",
-				"court": "Supreme Court",
-				"date": "1803",
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "http://scholar.google.com/scholar_case?case=11350538941232186766",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Meier ex rel. Meier v. Sun Intern. Hotels, Ltd.",
+				"creators": [],
+				"dateDecided": "April 19, 2002",
+				"court": "Court of Appeals, 11th Circuit",
+				"firstPage": "1264",
 				"itemID": "1",
-				"libraryCatalog": "Google Scholar"
+				"reporter": "F. 3d",
+				"reporterVolume": "288",
+				"attachments": [
+					{
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "http://scholar.google.com/scholar_case?case=4250138655935640563",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Patio Enclosures, Inc. v. Four Seasons Marketing Corp.",
+				"creators": [],
+				"dateDecided": "September 21, 2005",
+				"court": "Court of Appeals, 9th Appellate Dist.",
+				"extra": "{:jurisdiction: Ohio}",
+				"firstPage": "4933",
+				"itemID": "1",
+				"reporter": "Ohio",
+				"reporterVolume": "2005",
+				"attachments": [
+					{
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "http://scholar.google.com/scholar_case?case=8121501341214166807",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Click v. Estate of Click",
+				"creators": [],
+				"dateDecided": "June 13, 2007",
+				"court": "Court of Appeals, 4th Appellate Dist.",
+				"extra": "{:jurisdiction: Ohio}",
+				"firstPage": "3029",
+				"itemID": "1",
+				"reporter": "Ohio",
+				"reporterVolume": "2007",
+				"attachments": [
+					{
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "http://scholar.google.com/scholar_case?case=834584264358299037",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Kenty v. Transamerica Premium Ins. Co.",
+				"creators": [],
+				"dateDecided": "July 5, 1995",
+				"court": "Supreme Court",
+				"extra": "{:jurisdiction: Ohio}",
+				"firstPage": "415",
+				"itemID": "1",
+				"reporter": "Ohio St. 3d",
+				"reporterVolume": "72",
+				"attachments": [
+					{
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "http://scholar.google.com/scholar_case?case=15235797139493194004",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Tinker v. Des Moines Independent Community School Dist.",
+				"creators": [],
+				"dateDecided": "February 24, 1969",
+				"court": "Supreme Court",
+				"firstPage": "503",
+				"itemID": "1",
+				"reporter": "US",
+				"reporterVolume": "393",
+				"attachments": [
+					{
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "http://scholar.google.com/scholar_case?case=163483131267446711",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Kaimowitz v. Board of Trustees of U. of Illinois",
+				"creators": [],
+				"dateDecided": "December 23, 1991",
+				"court": "Court of Appeals, 7th Circuit",
+				"firstPage": "765",
+				"itemID": "1",
+				"reporter": "F. 2d",
+				"reporterVolume": "951",
+				"attachments": [
+					{
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "http://scholar.google.com/scholar_case?case=10394955686617635825",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Kline v. Mortgage Electronic Security Systems",
+				"creators": [],
+				"dateDecided": "February 27, 2013",
+				"court": "Dist. Court",
+				"docketNumber": "Case No. 3:08cv408",
+				"extra": "{:jurisdiction: SD Ohio}",
+				"attachments": [
+					{
+						"title": "Google Scholar Judgement",
+						"type": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
 			}
 		]
 	}
